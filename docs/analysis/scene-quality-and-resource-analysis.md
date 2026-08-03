@@ -2,7 +2,7 @@
 
 **Scope.** Why Scene's object world model scores 0.670 micro-F1, how the pipeline diverges from the ConceptGraphs paper it is built on, and why it does not fit on Orin-class hardware.
 
-**Evidence.** The five-world Webots evaluation behind [syswonder/robonix#199](https://github.com/syswonder/robonix/pull/199) — per-object statuses, `perception_quality` and `merge_gate_diagnostics` read out of the `DATA[]` payload in the generated review page, not restated from the summary table — plus the ingest path (`system/scene/scene_service/ingest/perception_concept_graphs.py`) on branch `agent/scene-object-management-177`, and the three Jetson build/run targets.
+**Evidence.** The five-world Webots evaluation behind [syswonder/robonix#199](https://github.com/syswonder/robonix/pull/199) — per-object statuses, `perception_quality` and `merge_gate_diagnostics` read out of the `DATA[]` payload in the generated review page, not restated from the summary table — plus the ingest path (`system/scene/scene_service/ingest/perception_concept_graphs.py`) on branches `agent/scene-object-management-177` and `dev-next`, and the three Jetson build/run targets. The object-persistence section is a code trace against a reproduction on real hardware.
 
 ---
 
@@ -18,11 +18,60 @@ The 0.670 micro-F1 is not one problem. It is three roughly equal ones — identi
 | **Ghost** (no admissible truth nearby) | 67 | Same, plus fragments drifting off the parent object |
 | **Missed** truth | 86 | Small-object culling; exploration coverage |
 
-Three findings drive everything below:
+Four findings drive everything below:
 
-1. **`canonical_eligible_pairs: 0` in all five worlds.** The upstream ConceptGraphs merge pass never fired once. The gate stack around it has become so conjunctive that it is unreachable.
-2. **Sub-30 cm objects score 0.54 recall and 0.30 label accuracy**, against 0.77 / 0.69 for everything larger. The pipeline collapses on small objects on both axes simultaneously.
-3. **PR #199 contains no resource work at all**, and its hottest new path runs an O(N²) Python loop every tick. The Jetson complaints are untouched.
+1. **On `dev-next`, a removed object is never removed from the map.** Confirmed on hardware: a water bottle on the floor is detected, then persists forever after being taken away. There is no observation-based removal path in that branch at all — see the next section. This is structural, not a threshold.
+2. **`canonical_eligible_pairs: 0` in all five worlds.** The upstream ConceptGraphs merge pass never fired once. The gate stack around it has become so conjunctive that it is unreachable.
+3. **Sub-30 cm objects score 0.54 recall and 0.30 label accuracy**, against 0.77 / 0.69 for everything larger. The pipeline collapses on small objects on both axes simultaneously.
+4. **PR #199 contains no resource work at all**, and its hottest new path runs an O(N²) Python loop every tick. The Jetson complaints are untouched.
+
+---
+
+## Field report: objects never disappear (`dev-next`)
+
+**Symptom.** A water bottle placed on the floor is detected correctly. Removed, it stays in the map indefinitely. Long-standing.
+
+**This is not a tuning problem.** On `dev-next` there is no negative-evidence path of any kind. Permanence is the designed-in outcome.
+
+`_project_to_registry()` (`perception_concept_graphs.py:1758`) builds its snapshot from the **entire persistent `MapObjectList`**, not from the current frame's detections:
+
+```python
+snapshots = []
+for obj in self._map_objects:      # :1779 — all of them, not this tick's detections
+    ...
+# and then, for every one:
+existing.last_seen = now           # :1979
+existing.missing = False           # :1980
+existing.observation_count += 1    # :1981
+```
+
+That replay defeats every safety net downstream:
+
+| Mechanism | Fires when | Why it never fires |
+|---|---|---|
+| `mark_stale` (`service.py:460`) | `now - last_seen > 5 s` | `last_seen` is refreshed every 0.6 s tick |
+| `soft_evict` | `cg_uuid not in live_uuids` | `live_uuids` is derived from that same full `MapObjectList` |
+| `prune_expired` (TTL 30 s) | record has `missing == True` | `missing` is forced back to `False` every tick |
+
+And `_map_objects` itself is only ever rewritten in six places — `merge_detections_to_objects`, `denoise_objects`, `filter_objects`, and the three collapse passes. Every one is **geometry culling or merging; none is observation-based.** A bottle's accumulated cloud clears `obj_min_points=20` easily, so even `filter_objects` cannot touch it.
+
+> Side effect worth knowing: `observation_count += 1` runs unconditionally every tick, so a stale object's observation count keeps climbing. If you have been reading that number in the UI as evidence of anything, it is not.
+
+This is exactly issue #177's second bullet — *"Historical objects refresh their 'last seen' timestamps through replay rather than fresh observation"* — which had not been connected to the user-visible "removed objects don't disappear" symptom.
+
+### Fixing it
+
+**Minimal fix, unblocks testing now.** Pass the set of uuids actually matched by detections this tick into `_project_to_registry`, and refresh `last_seen` / `missing` / `observation_count` only for those. `mark_stale` + `prune_expired` immediately start working and the bottle clears after grace (5 s) + TTL (30 s).
+
+But that buys only *time-based* removal: look away for 35 seconds and the object is gone. Absence of evidence is not evidence of absence — which is precisely why #199 wrote `_visible_missing_uuids`. The gating already exists on that branch (`_apply_snapshot`, `is_observed = bool(u and u in observed_uuids)` at `:6877`; the `observed_uuids is None` compatibility branch at `:6842` *is* the current `dev-next` behaviour).
+
+### A blind spot to watch, in the #199 mechanism too
+
+The depth-margin test has a systematic weakness for **objects resting on a supporting surface**. A sample counts as clear only when the measured depth exceeds the stored surface by `visibility_depth_margin_m` (0.10 m) — but an object's base sits flush against floor or table, so the ray passes through and lands on the support immediately behind. Delta ≈ 0 → scored `similar_depth` → not evidence.
+
+Geometric estimate for this specific bottle (camera ≈1 m high, bottle 0.25 m tall at ≈2 m): only the bottom ~4–5 cm of samples fail, giving a clear fraction around 0.8–0.9, comfortably above `min_clear_fraction=0.60`. **So this bottle should be correctly declared missing** once the gating is in place. A flat book, a plate, or anything on a table viewed near-horizontally is a different story — nearly every sample has the support surface flush behind it, and the object becomes permanent again.
+
+That estimate is geometric, not measured; worth confirming on hardware by reading `clear_fraction` and `depth_delta_median_m` out of `visibility_diagnostics`. The durable fix is to change the predicate from "measured surface is farther than the object" to "the surface measured at this pixel belongs to a known support plane rather than to the object" — or, more cheaply, to require clear evidence only from samples in the upper portion of the object's cloud.
 
 ---
 
@@ -203,6 +252,8 @@ This is the complaint heard most often, and it has the best effort-to-value rati
 
 ### Accuracy
 
+**A0 — Restore an observation-based removal path (do this first).** Gate `last_seen` / `missing` / `observation_count` on uuids actually matched this tick, then land #199's `_visible_missing_uuids` on top so removal rests on positive evidence of absence rather than a timer. Then fix the support-surface blind spot above. This is the only item on the list that users are hitting on real hardware today, and it is the smallest.
+
 **A1 — Make identity class-agnostic again.** Default `allow_cross_class_merge` to true; remove the class gate from association and from `merge_overlap_objects` eligibility. Keep the *geometric* identity test already built (voxel coverage + extent ratio + centroid distance) as the safety net — it is the right kind of gate, because it constrains physics rather than vocabulary. Treat the label as a per-track histogram property. Should recover most of the 64 duplicates: micro precision 0.627 → ~0.75 on duplicates alone, F1 → ~0.74, before any naming work.
 
 **A2 — Replace exact voxel intersection with a radius-tolerant nn-ratio.** `cKDTree(object_points).query_ball_point(det_points, r=2×voxel)` → fraction matched. This is the paper's measure, it is view-invariant, and it lets us delete several compensating gates. Do A1 and A2 together, then re-tune `merge_threshold` once from evidence rather than per-world.
@@ -235,7 +286,9 @@ This is the complaint heard most often, and it has the best effort-to-value rati
 
 ## 5. Suggested sequencing
 
-**R7 + R8 first.** Pure wins, no behaviour change, and they make every subsequent benchmark sweep cheaper. R7 should also fold in `same_class_merge_interval_ticks: 1`, the single hottest path #199 added.
+**A0 first, ahead of everything.** It is a live correctness bug on the branch being tested on hardware, the minimal form is a few lines, and every other accuracy measurement is contaminated while stale objects accumulate.
+
+**Then R7 + R8.** Pure wins, no behaviour change, and they make every subsequent benchmark sweep cheaper. R7 should also fold in `same_class_merge_interval_ticks: 1`, the single hottest path #199 added.
 
 **Then A1 + A2 together,** with one re-tune of `merge_threshold`. Largest single accuracy step, and it lets us **delete** most of the §0 gate stack rather than add to it. Concretely, A1 + A2 should let us drop the association-group gate, the co-observed 2D-IoU gate and the disjoint-history gate outright, keeping only the distance gate, the one-to-one constraint and the geometric identity test. Those three exist to compensate for a similarity measure that, once fixed, no longer misbehaves — better to delete them than keep tuning them. The diagnostics #199 added are exactly what will tell us whether that is safe.
 
